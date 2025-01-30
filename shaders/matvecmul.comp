@@ -1,0 +1,209 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+#version 460 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_NV_cooperative_matrix : enable
+#extension GL_NV_integer_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_NV_cooperative_vector : enable
+#extension GL_EXT_ray_tracing : enable
+
+// values filled out at pipeline creation time
+layout(constant_id = 0) const uint N = 1;
+layout(constant_id = 1) const uint K = 1;
+layout(constant_id = 2) const uint numLayers = 1;
+layout(constant_id = 3) const uint layerSize = 1;
+
+layout(buffer_reference) buffer InputVec { uint8_t x[]; } inputVec;
+layout(buffer_reference) buffer InputMat { uint8_t x[]; } inputMat;
+layout(buffer_reference) buffer InputBias { uint8_t x[]; } inputBias;
+layout(buffer_reference) buffer Output { uint8_t x[]; } outputO;
+layout(set=0, binding=0, std430) uniform Params { InputVec inputVec; InputMat inputMat; InputBias inputBias; Output outputO; } params;
+
+#if FRAG
+layout(constant_id = 4) const int workgroupSize = 0;
+uint globalInvocationIndex = uint(gl_FragCoord.x) + uint(gl_FragCoord.y)*workgroupSize;
+uint localInvocationIndex = uint(gl_FragCoord.x);
+#elif RAYGEN
+uint localInvocationIndex = gl_LaunchIDEXT.x;
+uint globalInvocationIndex = gl_LaunchIDEXT.x + gl_LaunchIDEXT.y*gl_LaunchSizeEXT.x;
+#else
+layout(local_size_x_id = 4, local_size_y = 1, local_size_z = 1) in;
+uint localInvocationIndex = gl_LocalInvocationIndex;
+uint globalInvocationIndex = gl_GlobalInvocationID.x;
+#endif
+
+#if INT8
+const int inputInterpretation = gl_ComponentTypeSignedInt8NV;
+const int matrixInterpretation = gl_ComponentTypeSignedInt8NV;
+const int biasInterpretation = gl_ComponentTypeSignedInt32NV;
+const uint inputElementSize = 1;
+const uint outputElementSize = 4;
+const uint inputVectorPaddedElements = 16;
+const uint outputVectorPaddedElements = 4;
+#define InputType int8_t
+#define OutputType int32_t
+#else
+#if E4M3
+const int inputInterpretation = gl_ComponentTypeFloatE4M3NV;
+const int matrixInterpretation = gl_ComponentTypeFloatE4M3NV;
+#else
+const int inputInterpretation = gl_ComponentTypeFloat16NV;
+const int matrixInterpretation = gl_ComponentTypeFloat16NV;
+#endif
+const int biasInterpretation = gl_ComponentTypeFloat16NV;
+const uint inputElementSize = 2;
+const uint outputElementSize = 2;
+const uint inputVectorPaddedElements = 8;
+const uint outputVectorPaddedElements = 8;
+#define InputType float16_t
+#define OutputType float16_t
+#endif
+
+uint inputBase = ((K + (inputVectorPaddedElements-1)) & ~(inputVectorPaddedElements-1)) * localInvocationIndex;
+uint outputBase = ((N + (outputVectorPaddedElements-1)) & ~(outputVectorPaddedElements-1)) * globalInvocationIndex;
+
+layout(constant_id = 5) const uint networkMatrixStride = 0;
+layout(constant_id = 6) const uint networkBiasStride = 0;
+layout(constant_id = 7) const uint mat0Offset = 0;
+layout(constant_id = 8) const uint mat1Offset = 0;
+layout(constant_id = 9) const uint mat2Offset = 0;
+layout(constant_id = 10) const uint mat3Offset = 0;
+
+layout(constant_id = 11) const uint bias0Offset = 0;
+layout(constant_id = 12) const uint bias1Offset = 0;
+layout(constant_id = 13) const uint bias2Offset = 0;
+layout(constant_id = 14) const uint bias3Offset = 0;
+layout(constant_id = 15) const int matrixLayout = 0;
+layout(constant_id = 16) const int nonuniform = 0;
+layout(constant_id = 17) const int resultShift = 0;
+layout(push_constant, std430) uniform PushConstantsBlock {
+    uint networkRepeatShift;
+};
+
+const uint mat0Stride = (K*inputElementSize + 16 - 1) & ~(16 - 1);
+const uint mat1Stride = (layerSize*inputElementSize + 16 - 1) & ~(16 - 1);
+const uint mat2Stride = (layerSize*inputElementSize + 16 - 1) & ~(16 - 1);
+const uint mat3Stride = (layerSize*inputElementSize + 16 - 1) & ~(16 - 1);
+
+layout(buffer_reference) buffer Uvec4Ref { uvec4 x[]; };
+
+void run()
+{
+    uint matOffsets[4] = { mat0Offset, mat1Offset, mat2Offset, mat3Offset };
+    uint biasOffsets[4] = { bias0Offset, bias1Offset, bias2Offset, bias3Offset };
+    uint matStrides[4] = { mat0Stride, mat1Stride, mat2Stride, mat3Stride };
+
+    InputVec inputVec = params.inputVec;
+    InputMat inputMat = params.inputMat;
+    InputBias inputBias = params.inputBias;
+    Output outputO = params.outputO;
+
+    coopvecNV<InputType, K> inVec;
+    coopvecNV<OutputType, N> outVec;
+
+    coopVecLoadNV(inVec, inputVec.x, inputBase * inputElementSize);
+
+    coopvecNV<OutputType, layerSize> vec;
+
+    uint32_t matrixIdx = globalInvocationIndex >> networkRepeatShift;
+
+    coopVecMatMulAddNV(vec,
+                       inVec,
+                       inputInterpretation,
+                       inputMat.x,
+                       (matrixIdx * networkMatrixStride + matOffsets[0]),
+                       matrixInterpretation,
+                       inputBias.x,
+                       (matrixIdx * networkBiasStride + biasOffsets[0]),
+                       biasInterpretation,
+                       layerSize, K,
+                       matrixLayout,
+                       false,
+                       matStrides[0]);
+
+    vec = max(vec, coopvecNV<OutputType, layerSize>(0));
+#if INT8
+    vec = vec >> coopvecNV<OutputType, layerSize>(resultShift);
+#endif
+
+    [[unroll]] for (uint i = 1; i < numLayers; ++i) {
+        coopVecMatMulAddNV(vec,
+                           vec,
+                           inputInterpretation,
+                           inputMat.x,
+                           (matrixIdx * networkMatrixStride + matOffsets[i]),
+                           matrixInterpretation,
+                           inputBias.x,
+                           (matrixIdx * networkBiasStride + biasOffsets[i]),
+                           biasInterpretation,
+                           layerSize, layerSize,
+                           matrixLayout,
+                           false,
+                           matStrides[i]);
+
+        vec = max(vec, coopvecNV<OutputType, layerSize>(0));
+#if INT8
+        vec = vec >> coopvecNV<OutputType, layerSize>(resultShift);
+#endif
+    }
+
+    coopVecMatMulAddNV(outVec,
+                       vec,
+                       inputInterpretation,
+                       inputMat.x,
+                       (matrixIdx * networkMatrixStride + matOffsets[numLayers]),
+                       matrixInterpretation,
+                       inputBias.x,
+                       (matrixIdx * networkBiasStride + biasOffsets[numLayers]),
+                       biasInterpretation,
+                       N, layerSize,
+                       matrixLayout,
+                       false,
+                       matStrides[numLayers]);
+
+    coopVecStoreNV(outVec, outputO.x, outputBase * outputElementSize);
+}
+
+void main()
+{
+#if FRAG
+    if (gl_HelperInvocation) {
+        return;
+    }
+#endif
+    if (nonuniform != 0) {
+        if ((localInvocationIndex & 31) < 31) {
+            run();
+        }
+    } else {
+        run();
+    }
+}
